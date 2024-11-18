@@ -22,6 +22,8 @@ namespace mediakit{
 
 class RtpSession : public toolkit::Session, public RtpSplitter {
 public:
+    static const std::string kVhost;
+    static const std::string kApp;
     static const std::string kStreamID;
     static const std::string kSSRC;
     static const std::string kOnlyTrack;
@@ -37,13 +39,16 @@ public:
     void setRtpProcess(RtpProcess::Ptr process);
 
 protected:
-    // 收到rtp回调
+    // 收到rtp回调  [AUTO-TRANSLATED:446b2cda]
+    // Received RTP callback
     void onRtpPacket(const char *data, size_t len) override;
     // RtpSplitter override
     const char *onSearchPacketTail(const char *data, size_t len) override;
-    // 搜寻SSRC
+    // 搜寻SSRC  [AUTO-TRANSLATED:2cfec2e1]
+    // Search for SSRC
     const char *searchBySSRC(const char *data, size_t len);
-    // 搜寻PS包里的关键帧标头
+    // 搜寻PS包里的关键帧标头  [AUTO-TRANSLATED:d8e88339]
+    // Search for keyframe header in PS packet
     const char *searchByPsHeaderFlag(const char *data, size_t len);
 
 private:
@@ -54,7 +59,7 @@ private:
     int _only_track = 0;
     uint32_t _ssrc = 0;
     toolkit::Ticker _ticker;
-    std::string _stream_id;
+    MediaTuple _tuple;
     struct sockaddr_storage _addr;
     RtpProcess::Ptr _process;
 };

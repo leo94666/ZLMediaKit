@@ -16,7 +16,8 @@ void G711RtpEncoder::setOpt(int opt, const toolkit::Any &param) {
                 WarnL << "set g711 rtp encoder  duration ms failed for " << dur;
                 return;
             }
-            // 向上 20ms 取整
+            // 向上 20ms 取整  [AUTO-TRANSLATED:b8a9e39e]
+            // Round up to the nearest 20ms
             _pkt_dur_ms = (dur + 19) / 20 * 20;
         }
     }
@@ -40,7 +41,7 @@ bool G711RtpEncoder::inputFrame(const Frame::Ptr &frame) {
     auto remain_size = len;
     size_t max_size = 160 * _channels * _pkt_dur_ms / 20; // 20 ms per 160 byte
     size_t n = 0;
-    bool mark = true;
+    bool mark = false;
     while (remain_size >= max_size) {
         assert(remain_size >= max_size);
         const size_t rtp_size = max_size;

@@ -24,7 +24,7 @@ namespace mediakit {
 PlayerBase::Ptr PlayerBase::createPlayer(const EventPoller::Ptr &in_poller, const string &url_in) {
     auto poller = in_poller ? in_poller : EventPollerPool::Instance().getPoller();
     std::weak_ptr<EventPoller> weak_poller = poller;
-    static auto release_func = [weak_poller](PlayerBase *ptr) {
+    auto release_func = [weak_poller](PlayerBase *ptr) {
         if (auto poller = weak_poller.lock()) {
             poller->async([ptr]() {
                 onceToken token(nullptr, [&]() { delete ptr; });
@@ -38,7 +38,8 @@ PlayerBase::Ptr PlayerBase::createPlayer(const EventPoller::Ptr &in_poller, cons
     string prefix = findSubString(url.data(), NULL, "://");
     auto pos = url.find('?');
     if (pos != string::npos) {
-        //去除？后面的字符串
+        // 去除？后面的字符串  [AUTO-TRANSLATED:0ccb41c2]
+        // Remove the string after the question mark
         url = url.substr(0, pos);
     }
 
