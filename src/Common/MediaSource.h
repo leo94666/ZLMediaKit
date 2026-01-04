@@ -94,17 +94,6 @@ public:
     // Get the current thread, this function is generally forced to overload
     virtual toolkit::EventPoller::Ptr getOwnerPoller(MediaSource &sender) { throw NotImplemented(toolkit::demangle(typeid(*this).name()) + "::getOwnerPoller not implemented"); }
 
-    // //////////////////////仅供MultiMediaSourceMuxer对象继承////////////////////////  [AUTO-TRANSLATED:6e810d1f]
-    // //////////////////////Only for MultiMediaSourceMuxer object inheritance////////////////////////
-    // 开启或关闭录制  [AUTO-TRANSLATED:3817e390]
-    // Start or stop recording
-    virtual bool setupRecord(MediaSource &sender, Recorder::type type, bool start, const std::string &custom_path, size_t max_second) { return false; };
-    // 获取录制状态  [AUTO-TRANSLATED:a0499880]
-    // Get recording status
-    virtual bool isRecording(MediaSource &sender, Recorder::type type) { return false; }
-    // 获取所有track相关信息  [AUTO-TRANSLATED:2141be42]
-    // Get all track related information
-    virtual std::vector<Track::Ptr> getMediaTracks(MediaSource &sender, bool trackReady = true) const { return std::vector<Track::Ptr>(); };
     // 获取MultiMediaSourceMuxer对象  [AUTO-TRANSLATED:2de96d44]
     // Get MultiMediaSourceMuxer object
     virtual std::shared_ptr<MultiMediaSourceMuxer> getMuxer(MediaSource &sender) const { return nullptr; }
@@ -125,7 +114,7 @@ public:
             kUdpActive = 1, // udp主动模式，主动发送数据给对方
             kTcpPassive = 2, // tcp被动模式，tcp服务器，等待对方连接并回复rtp
             kUdpPassive = 3, // udp被动方式，等待对方发送nat打洞包，然后回复rtp至打洞包源地址
-            kVoiceTalk = 4,  // 语音对讲模式，对方必须想推流上来，通过他的推流链路再回复rtp数据
+            kVoiceTalk = 4,  // 语音对讲模式，对方必须先推流上来，通过他的推流链路再回复rtp数据
         };
 
         // rtp类型  [AUTO-TRANSLATED:acca40ab]
@@ -175,14 +164,10 @@ public:
 
         std::string recv_stream_app;
         std::string recv_stream_vhost;
-    };
 
-    // 开始发送ps-rtp  [AUTO-TRANSLATED:a51796fa]
-    // Start sending ps-rtp
-    virtual void startSendRtp(MediaSource &sender, const SendRtpArgs &args, const std::function<void(uint16_t, const toolkit::SockException &)> cb) { cb(0, toolkit::SockException(toolkit::Err_other, "not implemented"));};
-    // 停止发送ps-rtp  [AUTO-TRANSLATED:952d2b35]
-    // Stop sending ps-rtp
-    virtual bool stopSendRtp(MediaSource &sender, const std::string &ssrc) {return false; }
+        // rtp tcp模式发送时busy时, origin 接收限流, 默认不启用
+        bool enable_origin_recv_limit = false;
+    };
 
 private:
     toolkit::Timer::Ptr _async_close_timer;
@@ -359,11 +344,6 @@ public:
     int totalReaderCount(MediaSource &sender) override;
     void onReaderChanged(MediaSource &sender, int size) override;
     void onRegist(MediaSource &sender, bool regist) override;
-    bool setupRecord(MediaSource &sender, Recorder::type type, bool start, const std::string &custom_path, size_t max_second) override;
-    bool isRecording(MediaSource &sender, Recorder::type type) override;
-    std::vector<Track::Ptr> getMediaTracks(MediaSource &sender, bool trackReady = true) const override;
-    void startSendRtp(MediaSource &sender, const SendRtpArgs &args, const std::function<void(uint16_t, const toolkit::SockException &)> cb) override;
-    bool stopSendRtp(MediaSource &sender, const std::string &ssrc) override;
     float getLossRate(MediaSource &sender, TrackType type) override;
     toolkit::EventPoller::Ptr getOwnerPoller(MediaSource &sender) override;
     std::shared_ptr<MultiMediaSourceMuxer> getMuxer(MediaSource &sender) const override;
@@ -388,6 +368,7 @@ public:
 
 public:
     uint16_t port = 0;
+    std::string protocol;
     std::string full_url;
     std::string schema;
     std::string host;
@@ -441,7 +422,9 @@ public:
 
     // 获取数据速率，单位bytes/s  [AUTO-TRANSLATED:c70465c1]
     // Get data rate, unit bytes/s
-    int getBytesSpeed(TrackType type = TrackInvalid);
+    size_t getBytesSpeed(TrackType type = TrackInvalid);
+    size_t getTotalBytes(TrackType type = TrackInvalid);
+
     // 获取流创建GMT unix时间戳，单位秒  [AUTO-TRANSLATED:0bbe145e]
     // Get the stream creation GMT unix timestamp, unit seconds
     uint64_t getCreateStamp() const { return _create_stamp; }

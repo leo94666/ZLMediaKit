@@ -34,14 +34,14 @@ VideoMeta::VideoMeta(const VideoTrack::Ptr &video) {
         _metadata.set("framerate", video->getVideoFps());
     }
     if (video->getBitRate()) {
-        _metadata.set("videodatarate", video->getBitRate() / 1024);
+        _metadata.set("videodatarate", video->getBitRate() >> 10);
     }
     _metadata.set("videocodecid", Factory::getAmfByCodecId(video->getCodecId()));
 }
 
 AudioMeta::AudioMeta(const AudioTrack::Ptr &audio) {
     if (audio->getBitRate()) {
-        _metadata.set("audiodatarate", audio->getBitRate() / 1024);
+        _metadata.set("audiodatarate", audio->getBitRate() >> 10);
     }
     if (audio->getAudioSampleRate() > 0) {
         _metadata.set("audiosamplerate", audio->getAudioSampleRate());
@@ -53,6 +53,33 @@ AudioMeta::AudioMeta(const AudioTrack::Ptr &audio) {
         _metadata.set("stereo", audio->getAudioChannel() > 1);
     }
     _metadata.set("audiocodecid", Factory::getAmfByCodecId(audio->getCodecId()));
+}
+
+uint8_t getCodecFlags(CodecId cid) {
+    switch(cid) {
+#define XX(a, b, c) case a: return static_cast<uint8_t>(b);
+    RTMP_CODEC_MAP(XX)
+#undef XX
+    }
+    return 0;
+}
+
+uint32_t getCodecFourCC(CodecId cid) {
+    switch(cid) {
+#define XX(a, b, c) case a: return static_cast<uint32_t>(c);
+    RTMP_CODEC_MAP(XX)
+#undef XX
+    }
+    return 0;
+}
+
+CodecId getFourccCodec(uint32_t id) {
+    switch(id) {
+#define XX(a, b, c) case (uint32_t)c: return a;
+    RTMP_CODEC_MAP(XX)
+#undef XX
+    }
+    return CodecInvalid;
 }
 
 uint8_t getAudioRtmpFlags(const Track::Ptr &track) {
@@ -68,29 +95,23 @@ uint8_t getAudioRtmpFlags(const Track::Ptr &track) {
             auto iChannel = audioTrack->getAudioChannel();
             auto iSampleBit = audioTrack->getAudioSampleBit();
 
-            uint8_t flvAudioType;
+            auto amf = Factory::getAmfByCodecId(track->getCodecId());
+            if (!amf) {
+                WarnL << "该编码格式不支持转换为RTMP: " << track->getCodecName();
+                return 0;
+            }
+            uint8_t flvAudioType = amf.as_integer();
             switch (track->getCodecId()) {
-                case CodecG711A: flvAudioType = (uint8_t)RtmpAudioCodec::g711a; break;
-                case CodecG711U: flvAudioType = (uint8_t)RtmpAudioCodec::g711u; break;
+                case CodecAAC:
                 case CodecOpus: {
-                    flvAudioType = (uint8_t)RtmpAudioCodec::opus;
-                    // opus不通过flags获取音频相关信息  [AUTO-TRANSLATED:0ddf328b]
-                    // opus does not get audio information through flags
+                    // opus/aac不通过flags获取音频相关信息  [AUTO-TRANSLATED:0ddf328b]
+                    // opus/aac does not get audio information through flags
                     iSampleRate = 44100;
                     iSampleBit = 16;
                     iChannel = 2;
                     break;
                 }
-                case CodecAAC: {
-                    flvAudioType = (uint8_t)RtmpAudioCodec::aac;
-                    // aac不通过flags获取音频相关信息  [AUTO-TRANSLATED:63ac5081]
-                    // aac does not get audio information through flags
-                    iSampleRate = 44100;
-                    iSampleBit = 16;
-                    iChannel = 2;
-                    break;
-                }
-                default: WarnL << "该编码格式不支持转换为RTMP: " << track->getCodecName(); return 0;
+                default: break;
             }
 
             uint8_t flvSampleRate;
@@ -173,7 +194,13 @@ bool RtmpPacket::isVideoKeyFrame() const {
 bool RtmpPacket::isConfigFrame() const {
     switch (type_id) {
         case MSG_AUDIO: {
-            return (RtmpAudioCodec)getRtmpCodecId() == RtmpAudioCodec::aac && (RtmpAACPacketType)buffer[1] == RtmpAACPacketType::aac_config_header;
+            switch ((RtmpAudioCodec)getRtmpCodecId()) {
+            case RtmpAudioCodec::aac:
+                return (RtmpAACPacketType)buffer[1] == RtmpAACPacketType::aac_config_header;
+            case RtmpAudioCodec::ex_header:
+                return (RtmpPacketType)(buffer[0] & 0x0f) == RtmpPacketType::PacketTypeSequenceStart;
+            }
+            return false;
         }
         case MSG_VIDEO: {
             if (!isVideoKeyFrame()) {
@@ -277,6 +304,8 @@ CodecId parseVideoRtmpPacket(const uint8_t *data, size_t size, RtmpPacketInfo *i
         switch ((RtmpVideoCodec)ntohl(enhanced_header->fourcc)) {
             case RtmpVideoCodec::fourcc_av1: info->codec = CodecAV1; break;
             case RtmpVideoCodec::fourcc_vp9: info->codec = CodecVP9; break;
+            case RtmpVideoCodec::fourcc_vp8: info->codec = CodecVP8; break;
+            case RtmpVideoCodec::fourcc_avc1: info->codec = CodecH264; break;
             case RtmpVideoCodec::fourcc_hevc: info->codec = CodecH265; break;
             default: WarnL << "Rtmp video codec not supported: " << std::string((char *)data + 1, 4);
         }
@@ -296,6 +325,21 @@ CodecId parseVideoRtmpPacket(const uint8_t *data, size_t size, RtmpPacketInfo *i
                 CHECK(size >= 1, "Invalid rtmp buffer size: ", size);
                 info->codec = CodecH265;
                 info->video.h264_pkt_type = (RtmpH264PacketType)classic_header->h264_pkt_type;
+                break;
+            }
+            case RtmpVideoCodec::vp8: {
+                CHECK(size >= 0, "Invalid rtmp buffer size: ", size);
+                info->codec = CodecVP8;
+                break;
+            }
+            case RtmpVideoCodec::vp9: {
+                CHECK(size >= 0, "Invalid rtmp buffer size: ", size);
+                info->codec = CodecVP9;
+                break;
+            }
+            case RtmpVideoCodec::av1: {
+                CHECK(size >= 0, "Invalid rtmp buffer size: ", size);
+                info->codec = CodecAV1;
                 break;
             }
             default: WarnL << "Rtmp video codec not supported: " << (int)classic_header->codec_id; break;

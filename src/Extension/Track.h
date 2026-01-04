@@ -195,16 +195,21 @@ public:
         _fps = fps;
     }
 
+    VideoTrackImp(CodecId codec_id) { 
+        _codec_id = codec_id;
+        _fps = 30;
+    }
+
     int getVideoWidth() const override { return _width; }
     int getVideoHeight() const override { return _height; }
     float getVideoFps() const override { return _fps; }
-    bool ready() const override { return true; }
+    bool ready() const override { return _width > 0 && _height > 0; }
 
     Track::Ptr clone() const override { return std::make_shared<VideoTrackImp>(*this); }
-    Sdp::Ptr getSdp(uint8_t payload_type) const override { return nullptr; }
+    Sdp::Ptr getSdp(uint8_t payload_type) const override;
     CodecId getCodecId() const override { return _codec_id; }
 
-private:
+protected:
     CodecId _codec_id;
     int _width = 0;
     int _height = 0;
@@ -298,7 +303,7 @@ public:
      * [AUTO-TRANSLATED:9af5a0a4]
      */
     int getAudioSampleRate() const override{
-        return _sample_rate;
+        return _sample_rate ? _sample_rate : RtpPayload::getClockRateByCodec(_codecid);
     }
 
     /**
@@ -308,7 +313,7 @@ public:
      * [AUTO-TRANSLATED:5fedc65d]
      */
     int getAudioSampleBit() const override{
-        return _sample_bit;
+        return _sample_bit ? _sample_bit : 16;
     }
 
     /**
@@ -318,13 +323,13 @@ public:
      * [AUTO-TRANSLATED:2613b317]
      */
     int getAudioChannel() const override{
-        return _channels;
+        return _channels ? _channels : 1;
     }
 
     Track::Ptr clone() const override { return std::make_shared<AudioTrackImp>(*this); }
-    Sdp::Ptr getSdp(uint8_t payload_type) const override { return nullptr; }
+    Sdp::Ptr getSdp(uint8_t payload_type) const override;
 
-private:
+protected:
     CodecId _codecid;
     int _sample_rate;
     int _channels;

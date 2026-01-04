@@ -114,7 +114,7 @@ string RtcpHeader::dumpHeader() const {
     printer << "pt:" << rtcpTypeToStr((RtcpType)pt) << "\r\n";
     printer << "size:" << getSize() << "\r\n";
     printer << "--------\r\n";
-    return std::move(printer);
+    return printer;
 }
 
 string RtcpHeader::dumpString() const {
@@ -209,8 +209,13 @@ void RtcpHeader::net2Host(size_t len) {
                 RtcpXRDLRR *dlrr = (RtcpXRDLRR *)this;
                 dlrr->net2Host(len);
                 TraceL << dlrr->dumpString();
+            } else if (xr->bt == 42){
+                //当有浏览器将屏幕推流到服务器时会发生这个, 暂时没发现什么作用，先解析出来，不做处理
+                RtcpXRTargetBitrate* tb = (RtcpXRTargetBitrate *)this;
+                tb->net2Host(len);
+                //TraceL << tb->dumpString();
             } else {
-                throw std::runtime_error(StrPrinter << "rtcp xr bt " << xr->bt << " not support");
+                throw std::runtime_error(StrPrinter << "rtcp xr bt " << (int)xr->bt << " not support");
             }
             break;
         }
@@ -317,7 +322,7 @@ string RtcpSR::dumpString() const {
         printer << "---- item:" << i++ << " ----\r\n";
         printer << item->dumpString();
     }
-    return std::move(printer);
+    return printer;
 }
 
 #define CHECK_MIN_SIZE(size, kMinSize)                                                                                 \
@@ -380,7 +385,7 @@ string ReportItem::dumpString() const {
     printer << "jitter:" << jitter << "\r\n";
     printer << "last_sr_stamp:" << last_sr_stamp << "\r\n";
     printer << "delay_since_last_sr:" << delay_since_last_sr << "\r\n";
-    return std::move(printer);
+    return printer;
 }
 
 void ReportItem::net2Host() {
@@ -414,7 +419,7 @@ string RtcpRR::dumpString() const {
         printer << "---- item:" << i++ << " ----\r\n";
         printer << item->dumpString();
     }
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpRR::net2Host(size_t size) {
@@ -462,7 +467,7 @@ string SdesChunk::dumpString() const {
     printer << "type:" << sdesTypeToStr((SdesType)type) << "\r\n";
     printer << "txt_len:" << (int)txt_len << "\r\n";
     printer << "text:" << (txt_len ? string(text, txt_len) : "") << "\r\n";
-    return std::move(printer);
+    return printer;
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -501,7 +506,7 @@ string RtcpSdes::dumpString() const {
         printer << "---- item:" << i++ << " ----\r\n";
         printer << item->dumpString();
     }
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpSdes::net2Host(size_t size) {
@@ -622,7 +627,7 @@ string RtcpFB::dumpString() const {
         }
         default: /*不可达*/ assert(0); break;
     }
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpFB::net2Host(size_t size) {
@@ -679,7 +684,7 @@ string RtcpBye::dumpString() const {
         printer << "ssrc:" << *ssrc << "\r\n";
     }
     printer << "reason:" << getReason();
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpBye::net2Host(size_t size) {
@@ -714,7 +719,7 @@ string RtcpXRRRTR::dumpString() const {
     printer << "block_length : " << block_length << "\r\n";
     printer << "ntp msw : " << ntpmsw << "\r\n";
     printer << "ntp lsw : " << ntplsw << "\r\n";
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpXRRRTR::net2Host(size_t size) {
@@ -738,7 +743,7 @@ string RtcpXRDLRRReportItem::dumpString() const {
     printer << "last RR (lrr) :" << lrr << "\r\n";
     printer << "delay since last RR (dlrr): " << dlrr << "\r\n";
 
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpXRDLRRReportItem::net2Host() {
@@ -769,7 +774,7 @@ string RtcpXRDLRR::dumpString() const {
         printer << "---- item:" << i++ << " ----\r\n";
         printer << item->dumpString();
     }
-    return std::move(printer);
+    return printer;
 }
 
 void RtcpXRDLRR::net2Host(size_t size) {
@@ -794,6 +799,71 @@ std::shared_ptr<RtcpXRDLRR> RtcpXRDLRR::create(size_t item_count) {
     setupHeader(ptr, RtcpType::RTCP_XR, 0, bytes);
     setupPadding(ptr, bytes - real_size);
     return std::shared_ptr<RtcpXRDLRR>(ptr, [](RtcpXRDLRR *ptr) { delete[](char *) ptr; });
+}
+
+////////////////////////////////////
+string RtcpXRTargetBitrateItem::dumpString() const {
+    _StrPrinter printer;
+
+    printer << "Spatial Layer :" << spatial_layer << "\r\n";
+    printer << "Temporal Layer :" << temporal_layer << "\r\n";
+    printer << "Target Bitrate: " << target_bitrate << "\r\n";
+
+    return printer;
+}
+
+void RtcpXRTargetBitrateItem::net2Host() {
+
+    target_bitrate = ntohl(target_bitrate) >> 8;
+}
+
+std::vector<RtcpXRTargetBitrateItem *> RtcpXRTargetBitrate::getItemList() {
+    auto count = block_length;
+    RtcpXRTargetBitrateItem *ptr = &items;
+    vector<RtcpXRTargetBitrateItem *> ret;
+    for (int i = 0; i < (int)count; ++i) {
+        ret.emplace_back(ptr);
+        ++ptr;
+    }
+    return ret;
+}
+string RtcpXRTargetBitrate::dumpString() const {
+    _StrPrinter printer;
+    printer << RtcpHeader::dumpHeader();
+    printer << "ssrc :" << ssrc << "\r\n";
+    printer << "bt :" << (int)bt << "\r\n";
+    printer << "block_length : " << block_length << "\r\n";
+    auto items_list = ((RtcpXRTargetBitrate *)this)->getItemList();
+    auto i = 0;
+    for (auto &item : items_list) {
+        printer << "---- item:" << i++ << " ----\r\n";
+        printer << item->dumpString();
+    }
+    return printer;
+}
+
+void RtcpXRTargetBitrate::net2Host(size_t size) {
+    static const size_t kMinSize = sizeof(RtcpHeader);
+    CHECK_MIN_SIZE(size, kMinSize);
+
+    ssrc = ntohl(ssrc);
+    block_length = ntohs(block_length);
+
+    auto count = block_length;
+    for (int i = 0; i < (int)count; ++i) {
+        RtcpXRTargetBitrateItem *ptr = &items;
+        ptr->net2Host();
+        ptr++;
+    }
+}
+
+std::shared_ptr<RtcpXRTargetBitrate> RtcpXRTargetBitrate::create(size_t item_count) {
+    auto real_size = sizeof(RtcpXRTargetBitrate) - sizeof(RtcpXRTargetBitrateItem) + item_count * sizeof(RtcpXRTargetBitrateItem);
+    auto bytes = alignSize(real_size);
+    auto ptr = (RtcpXRTargetBitrate *)new char[bytes];
+    setupHeader(ptr, RtcpType::RTCP_XR, 0, bytes);
+    setupPadding(ptr, bytes - real_size);
+    return std::shared_ptr<RtcpXRTargetBitrate>(ptr, [](RtcpXRTargetBitrate *ptr) { delete[](char *) ptr; });
 }
 
 #if 0

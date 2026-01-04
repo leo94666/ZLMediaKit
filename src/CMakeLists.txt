@@ -1,6 +1,6 @@
 # MIT License
 #
-# Copyright (c) 2016-2022 The ZLMediaKit project authors. All Rights Reserved.
+# Copyright (c) 2016-present The ZLMediaKit project authors. All Rights Reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -49,6 +49,7 @@ target_link_libraries(zlmediakit
 target_include_directories(zlmediakit
   PRIVATE
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>"
+    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/..>"
   PUBLIC
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>")
 
@@ -58,8 +59,9 @@ update_cached_list(MK_LINK_LIBRARIES ZLMediaKit::MediaKit)
 if(ENABLE_CXX_API)
   # 保留目录结构
   install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
-    DESTINATION ${INSTALL_PATH_INCLUDE}/ZLMediaKit
-    REGEX ".*[.](md|cpp)$" EXCLUDE)
+      DESTINATION ${INSTALL_PATH_INCLUDE}/ZLMediaKit
+      FILES_MATCHING
+        PATTERN "*.h")
   install(TARGETS zlmediakit
     DESTINATION ${INSTALL_PATH_LIB})
 endif ()

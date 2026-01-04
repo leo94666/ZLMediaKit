@@ -30,7 +30,22 @@ bool loadIniConfig(const char *ini_path) {
         ini = exePath() + ".ini";
     }
     try {
-        mINI::Instance().parseFile(ini);
+        mINI tmp;
+        tmp.parseFile(ini);
+
+        auto &ref = mINI::Instance();
+        for (auto &pr : tmp) {
+            if (ref.find(pr.first) == ref.end()) {
+                // 新增键
+                WarnL << "unknow config: " << pr.first << " = " << pr.second;
+                ref.emplace(pr);
+            } else {
+                // 更新键
+                ref[pr.first] = pr.second;
+            }
+        }
+        // 更新注释和排序
+        ref.updateFrom(tmp);
         NOTICE_EMIT(BroadcastReloadConfigArgs, Broadcast::kBroadcastReloadConfig);
         return true;
     } catch (std::exception &) {
@@ -256,7 +271,7 @@ static onceToken token([]() {
     mINI::Instance()[kHandshakeSecond] = 15;
     mINI::Instance()[kKeepAliveSecond] = 15;
     mINI::Instance()[kDirectProxy] = 1;
-    mINI::Instance()[kEnhanced] = 0;
+    mINI::Instance()[kEnhanced] = 1;
 });
 } // namespace Rtmp
 
@@ -366,6 +381,7 @@ const string kOpusPT = RTP_PROXY_FIELD "opus_pt";
 const string kGopCache = RTP_PROXY_FIELD "gop_cache";
 const string kRtpG711DurMs = RTP_PROXY_FIELD "rtp_g711_dur_ms";
 const string kUdpRecvSocketBuffer = RTP_PROXY_FIELD "udp_recv_socket_buffer";
+const std::string kMergeFrame = RTP_PROXY_FIELD "merge_frame";
 
 static onceToken token([]() {
     mINI::Instance()[kDumpDir] = "";
@@ -378,6 +394,7 @@ static onceToken token([]() {
     mINI::Instance()[kGopCache] = 1;
     mINI::Instance()[kRtpG711DurMs] = 100;
     mINI::Instance()[kUdpRecvSocketBuffer] = 4 * 1024 * 1024;
+    mINI::Instance()[kMergeFrame] = 1;
 });
 } // namespace RtpProxy
 
@@ -396,6 +413,9 @@ const string kWaitTrackReady = "wait_track_ready";
 const string kPlayTrack = "play_track";
 const string kProxyUrl = "proxy_url";
 const string kRtspSpeed = "rtsp_speed";
+const string kLatency = "latency";
+const string kPassPhrase = "passPhrase";
+const string kCustomHeader = "custom_header";
 } // namespace Client
 
 } // namespace mediakit

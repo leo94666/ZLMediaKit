@@ -57,6 +57,10 @@
 #include "../webrtc/WebRtcPlayer.h"
 #include "../webrtc/WebRtcPusher.h"
 #include "../webrtc/WebRtcEchoTest.h"
+#include "../webrtc/WebRtcSignalingPeer.h"
+#include "../webrtc/WebRtcSignalingSession.h"
+#include "../webrtc/WebRtcProxyPlayer.h"
+#include "../webrtc/WebRtcProxyPlayerImp.h"
 #endif
 
 #if defined(ENABLE_VERSION)
@@ -66,6 +70,9 @@
 #if defined(ENABLE_VIDEOSTACK) && defined(ENABLE_X264) && defined (ENABLE_FFMPEG)
 #include "VideoStack.h"
 #endif
+
+#include "Onvif/Onvif.h"
+#include "Onvif/SoapUtil.h"
 
 using namespace std;
 using namespace Json;
@@ -293,91 +300,26 @@ static inline void addHttpListener(){
             };
             ((HttpSession::HttpResponseInvoker &) invoker) = newInvoker;
         }
-
-        try {
-            it->second(parser, invoker, sender);
-        } catch (ApiRetException &ex) {
-            responseApi(ex.code(), ex.what(), invoker);
-            auto helper = static_cast<SocketHelper &>(sender).shared_from_this();
-            helper->getPoller()->async([helper, ex]() { helper->shutdown(SockException(Err_shutdown, ex.what())); }, false);
-        }
+        auto helper = static_cast<SocketHelper &>(sender).shared_from_this();
+        // 在本poller线程下一次事件循环时执行http api，防止占用NoticeCenter的锁
+        helper->getPoller()->async([it, parser, invoker, helper]() {
+            try {
+                it->second(parser, invoker, *helper);
+            } catch (ApiRetException &ex) {
+                responseApi(ex.code(), ex.what(), invoker);
+                helper->getPoller()->async([helper, ex]() { helper->shutdown(SockException(Err_shutdown, ex.what())); }, false);
+            }
 #ifdef ENABLE_MYSQL
-        catch(SqlException &ex){
-            responseApi(API::SqlFailed, StrPrinter << "操作数据库失败:" << ex.what() << ":" << ex.getSql(), invoker);
-        }
-#endif// ENABLE_MYSQL
-        catch (std::exception &ex) {
-            responseApi(API::Exception, ex.what(), invoker);
-        }
+            catch (SqlException &ex) {
+                responseApi(API::SqlFailed, StrPrinter << "操作数据库失败:" << ex.what() << ":" << ex.getSql(), invoker);
+            }
+#endif // ENABLE_MYSQL
+            catch (std::exception &ex) {
+                responseApi(API::Exception, ex.what(), invoker);
+            }
+        },false);
     });
 }
-
-template <typename Type>
-class ServiceController {
-public:
-    using Pointer = std::shared_ptr<Type>;
-    std::unordered_map<std::string, Pointer> _map;
-    mutable std::recursive_mutex _mtx;
-
-    void clear() {
-        decltype(_map) copy;
-        {
-            std::lock_guard<std::recursive_mutex> lck(_mtx);
-            copy.swap(_map);
-        }
-    }
-
-    size_t erase(const std::string &key) {
-        std::lock_guard<std::recursive_mutex> lck(_mtx);
-        return _map.erase(key);
-    }
-
-    size_t size() { 
-        std::lock_guard<std::recursive_mutex> lck(_mtx);
-        return _map.size();
-    }
-
-    Pointer find(const std::string &key) const {
-        std::lock_guard<std::recursive_mutex> lck(_mtx);
-        auto it = _map.find(key);
-        if (it == _map.end()) {
-            return nullptr;
-        }
-        return it->second;
-    }
-
-    void for_each(const std::function<void(const std::string&, const Pointer&)>& cb) {
-        std::lock_guard<std::recursive_mutex> lck(_mtx);
-        auto it = _map.begin();
-        while (it != _map.end()) {
-            cb(it->first, it->second);
-            it++;
-        }
-    }
-
-    template<class ..._Args>
-    Pointer make(const std::string &key, _Args&& ...__args) {
-        // assert(!find(key));
-
-        auto server = std::make_shared<Type>(std::forward<_Args>(__args)...);
-        std::lock_guard<std::recursive_mutex> lck(_mtx);
-        auto it = _map.emplace(key, server);
-        assert(it.second);
-        return server;
-    }
-
-    template<class ..._Args>
-    Pointer makeWithAction(const std::string &key, function<void(Pointer)> action, _Args&& ...__args) {
-        // assert(!find(key));
-
-        auto server = std::make_shared<Type>(std::forward<_Args>(__args)...);
-        action(server);
-        std::lock_guard<std::recursive_mutex> lck(_mtx);
-        auto it = _map.emplace(key, server);
-        assert(it.second);
-        return server;
-    }
-};
 
 // 拉流代理器列表  [AUTO-TRANSLATED:6dcfb11f]
 // Pull stream proxy list
@@ -423,7 +365,10 @@ Value ToJson(const PusherProxy::Ptr& p) {
     item["url"] = p->getUrl();
     item["status"] = p->getStatus();
     item["liveSecs"] = p->getLiveSecs();
-    item["rePublishCount"] = p->getRePublishCount();
+    item["rePublishCount"] = p->getRePublishCount();    
+    item["bytesSpeed"] = (Json::UInt64) p->getSendSpeed();
+    item["totalBytes"] =(Json::UInt64) p->getSendTotalBytes();
+
     if (auto src = p->getSrc()) {
         dumpMediaTuple(src->getMediaTuple(), item["src"]);
     }
@@ -437,6 +382,9 @@ Value ToJson(const PlayerProxy::Ptr& p) {
     item["liveSecs"] = p->getLiveSecs();
     item["rePullCount"] = p->getRePullCount();
     item["totalReaderCount"] = p->totalReaderCount();
+    item["bytesSpeed"] = (Json::UInt64) p->getRecvSpeed();
+    item["totalBytes"] = (Json::UInt64) p->getRecvTotalBytes();
+
     dumpMediaTuple(p->getMediaTuple(), item["src"]);
     return item;
 }
@@ -446,8 +394,10 @@ Value makeMediaSourceJson(MediaSource &media){
     item["schema"] = media.getSchema();
     dumpMediaTuple(media.getMediaTuple(), item);
     item["createStamp"] = (Json::UInt64) media.getCreateStamp();
+    item["currentStamp"] = (Json::UInt64) media.getTimeStamp(TrackInvalid);
     item["aliveSecond"] = (Json::UInt64) media.getAliveSecond();
-    item["bytesSpeed"] = media.getBytesSpeed();
+    item["bytesSpeed"] = (Json::UInt64) media.getBytesSpeed();
+    item["totalBytes"] = (Json::UInt64) media.getTotalBytes();
     item["readerCount"] = media.readerCount();
     item["totalReaderCount"] = media.totalReaderCount();
     item["originType"] = (int) media.getOriginType();
@@ -570,7 +520,7 @@ void getStatisticJson(const function<void(Value &val)> &cb) {
 #ifdef ENABLE_MEM_DEBUG
     auto bytes = getTotalMemUsage();
     val["totalMemUsage"] = (Json::UInt64) bytes;
-    val["totalMemUsageMB"] = (int) (bytes / 1024 / 1024);
+    val["totalMemUsageMB"] = (int) (bytes >> 20);
     val["totalMemBlock"] = (Json::UInt64) getTotalMemBlock();
     static auto block_type_size = getBlockTypeSize();
     {
@@ -604,7 +554,7 @@ void getStatisticJson(const function<void(Value &val)> &cb) {
             auto bytes = getThisThreadMemUsage();
             val["threadName"] = getThreadName();
             val["threadMemUsage"] = (Json::UInt64) bytes;
-            val["threadMemUsageMB"] = (Json::UInt64) (bytes / 1024 / 1024);
+            val["threadMemUsageMB"] = (Json::UInt64) (bytes >> 20);
             val["threadMemBlock"] = (Json::UInt64) getThisThreadMemBlock();
             {
                 int i = 0;
@@ -685,6 +635,7 @@ void addStreamPusherProxy(const string &schema,
                           int retry_count,
                           int rtp_type,
                           float timeout_sec,
+                          const mINI &args,
                           const function<void(const SockException &ex, const string &key)> &cb) {
     auto key = getPusherKey(schema, vhost, app, stream, url);
     auto src = MediaSource::find(schema, vhost, app, stream);
@@ -703,14 +654,20 @@ void addStreamPusherProxy(const string &schema,
     // Add push stream proxy
     auto pusher = s_pusher_proxy.make(key, src, retry_count);
 
+    // 先透传拷贝参数  [AUTO-TRANSLATED:22b5605e]
+    // First pass-through copy parameters
+    for (auto &pr : args) {
+        (*pusher)[pr.first] = pr.second;
+    }
+
     // 指定RTP over TCP(播放rtsp时有效)  [AUTO-TRANSLATED:1a062656]
     // Specify RTP over TCP (effective when playing RTSP)
-    pusher->emplace(Client::kRtpType, rtp_type);
+    (*pusher)[Client::kRtpType] = rtp_type;
 
     if (timeout_sec > 0.1f) {
         // 推流握手超时时间  [AUTO-TRANSLATED:00762fc1]
         // Push stream handshake timeout
-        pusher->emplace(Client::kTimeoutMS, timeout_sec * 1000);
+        (*pusher)[Client::kTimeoutMS] = timeout_sec * 1000;
     }
 
     // 开始推流，如果推流失败或者推流中止，将会自动重试若干次，默认一直重试  [AUTO-TRANSLATED:c8b95088]
@@ -732,6 +689,26 @@ void addStreamPusherProxy(const string &schema,
     pusher->publish(url);
 }
 
+void getThreadsLoad(TaskExecutorGetterImp &getter, API_ARGS_MAP_ASYNC) {
+    getter.getExecutorDelay([&getter, invoker, headerOut](const vector<int> &vecDelay) {
+        Value val;
+        auto vec = getter.getExecutorLoad();
+        std::vector<EventPoller::Ptr> pollers;
+        getter.for_each([&](const TaskExecutor::Ptr &exe) { pollers.emplace_back(std::static_pointer_cast<EventPoller>(exe)); });
+        int i = API::Success;
+        for (auto load : vec) {
+            Value obj(objectValue);
+            obj["load"] = load;
+            auto &poller = pollers[i];
+            obj["name"] = poller->getThreadName();
+            obj["fd_count"] = static_cast<Json::UInt64>(poller->fdCount());
+            obj["delay"] = vecDelay[i++];
+            val["data"].append(obj);
+        }
+        val["code"] = API::Success;
+        invoker(200, headerOut, val.toStyledString());
+    });
+}
 
 /**
  * 安装api接口
@@ -740,7 +717,7 @@ void addStreamPusherProxy(const string &schema,
  * Install api interface
  * All apis support GET and POST methods
  * POST method parameters support application/json and application/x-www-form-urlencoded methods
- 
+
  * [AUTO-TRANSLATED:62e68c43]
  */
 void installWebApi() {
@@ -753,19 +730,7 @@ void installWebApi() {
     // Test url http://127.0.0.1/index/api/getThreadsLoad
     api_regist("/index/api/getThreadsLoad", [](API_ARGS_MAP_ASYNC) {
         CHECK_SECRET();
-        EventPollerPool::Instance().getExecutorDelay([invoker, headerOut](const vector<int> &vecDelay) {
-            Value val;
-            auto vec = EventPollerPool::Instance().getExecutorLoad();
-            int i = API::Success;
-            for (auto load : vec) {
-                Value obj(objectValue);
-                obj["load"] = load;
-                obj["delay"] = vecDelay[i++];
-                val["data"].append(obj);
-            }
-            val["code"] = API::Success;
-            invoker(200, headerOut, val.toStyledString());
-        });
+        getThreadsLoad(EventPollerPool::Instance(), API_ARGS_VALUE, invoker);
     });
 
     // 获取后台工作线程负载  [AUTO-TRANSLATED:6166e265]
@@ -774,19 +739,7 @@ void installWebApi() {
     // Test url http://127.0.0.1/index/api/getWorkThreadsLoad
     api_regist("/index/api/getWorkThreadsLoad", [](API_ARGS_MAP_ASYNC) {
         CHECK_SECRET();
-        WorkThreadPool::Instance().getExecutorDelay([invoker, headerOut](const vector<int> &vecDelay) {
-            Value val;
-            auto vec = WorkThreadPool::Instance().getExecutorLoad();
-            int i = 0;
-            for (auto load : vec) {
-                Value obj(objectValue);
-                obj["load"] = load;
-                obj["delay"] = vecDelay[i++];
-                val["data"].append(obj);
-            }
-            val["code"] = API::Success;
-            invoker(200, headerOut, val.toStyledString());
-        });
+        getThreadsLoad(WorkThreadPool::Instance(), API_ARGS_VALUE, invoker);
     });
 
     // 获取服务器配置  [AUTO-TRANSLATED:7dd2f3da]
@@ -959,13 +912,28 @@ void installWebApi() {
     // Test url1 (get streams with virtual host "__defaultVost__") http://127.0.0.1/index/api/getMediaList?vhost=__defaultVost__
     // 测试url2(获取rtsp类型的流) http://127.0.0.1/index/api/getMediaList?schema=rtsp  [AUTO-TRANSLATED:21c2c15d]
     // Test url2 (get rtsp type streams) http://127.0.0.1/index/api/getMediaList?schema=rtsp
-    api_regist("/index/api/getMediaList",[](API_ARGS_MAP){
+    api_regist("/index/api/getMediaList",[](API_ARGS_MAP_ASYNC){
         CHECK_SECRET();
         // 获取所有MediaSource列表  [AUTO-TRANSLATED:7bf16dc2]
         // Get all MediaSource lists
+        std::list<MediaSource::Ptr> lst;
         MediaSource::for_each_media([&](const MediaSource::Ptr &media) {
-            val["data"].append(makeMediaSourceJson(*media));
+            lst.emplace_back(media);
         }, allArgs["schema"], allArgs["vhost"], allArgs["app"], allArgs["stream"]);
+
+        if (lst.size() == 1) {
+            // 如果是搜索单一流，那么在它的归属线程中执行，用于获取丢包率参数
+            auto front = std::move(lst.front());
+            front->getOwnerPoller()->async([=]() mutable {
+                val["data"].append(makeMediaSourceJson(*front));
+                invoker(200, headerOut, val.toStyledString());
+            });
+        } else {
+            for (auto &media : lst) {
+                val["data"].append(makeMediaSourceJson(*media));
+            }
+            invoker(200, headerOut, val.toStyledString());
+        }
     });
 
     // 测试url http://127.0.0.1/index/api/isMediaOnline?schema=rtsp&vhost=__defaultVhost__&app=live&stream=obs  [AUTO-TRANSLATED:126a75e8]
@@ -1000,9 +968,9 @@ void installWebApi() {
             },
             [](toolkit::Any &&info) -> toolkit::Any {
                 auto obj = std::make_shared<Value>();
-                auto &sock = info.get<SockInfo>();
-                fillSockInfo(*obj, &sock);
-                (*obj)["typeid"] = toolkit::demangle(typeid(sock).name());
+                auto &session = info.get<Session>();
+                fillSockInfo(*obj, &session);
+                (*obj)["typeid"] = toolkit::demangle(typeid(session).name());
                 toolkit::Any ret;
                 ret.set(obj);
                 return ret;
@@ -1083,9 +1051,8 @@ void installWebApi() {
 
         bool force = allArgs["force"].as<bool>();
         for (auto &media : media_list) {
-            if (media->close(force)) {
-                ++count_closed;
-            }
+            media->getOwnerPoller()->async([media, force]() { media->close(force); });
+            ++count_closed;
         }
         val["count_hit"] = count_hit;
         val["count_closed"] = count_closed;
@@ -1174,26 +1141,35 @@ void installWebApi() {
     api_regist("/index/api/addStreamPusherProxy", [](API_ARGS_MAP_ASYNC) {
         CHECK_SECRET();
         CHECK_ARGS("schema", "vhost", "app", "stream", "dst_url");
+
+        mINI args;
+        for (auto &pr : allArgs.args) {
+            args.emplace(pr.first, pr.second);
+        }
+
         auto dst_url = allArgs["dst_url"];
         auto retry_count = allArgs["retry_count"].empty() ? -1 : allArgs["retry_count"].as<int>();
-        addStreamPusherProxy(allArgs["schema"],
-                             allArgs["vhost"],
-                             allArgs["app"],
-                             allArgs["stream"],
-                             allArgs["dst_url"],
-                             retry_count,
-                             allArgs["rtp_type"],
-                             allArgs["timeout_sec"],
-                             [invoker, val, headerOut, dst_url](const SockException &ex, const string &key) mutable {
-                                 if (ex) {
-                                     val["code"] = API::OtherFailed;
-                                     val["msg"] = ex.what();
-                                 } else {
-                                     val["data"]["key"] = key;
-                                     InfoL << "Publish success, please play with player:" << dst_url;
-                                 }
-                                 invoker(200, headerOut, val.toStyledString());
-                             });
+        EventPollerPool::Instance().getPoller(false)->async([=]() mutable {
+            addStreamPusherProxy(allArgs["schema"],
+                                 allArgs["vhost"],
+                                 allArgs["app"],
+                                 allArgs["stream"],
+                                 allArgs["dst_url"],
+                                 retry_count,
+                                 allArgs["rtp_type"],
+                                 allArgs["timeout_sec"],
+                                 args,
+                                 [invoker, val, headerOut, dst_url](const SockException &ex, const string &key) mutable {
+                                     if (ex) {
+                                         val["code"] = API::OtherFailed;
+                                         val["msg"] = ex.what();
+                                     } else {
+                                         val["data"]["key"] = key;
+                                         InfoL << "Publish success, please play with player:" << dst_url;
+                                     }
+                                     invoker(200, headerOut, val.toStyledString());
+                                 });
+        });
     });
 
     // 关闭推流代理  [AUTO-TRANSLATED:91602b75]
@@ -1242,22 +1218,24 @@ void installWebApi() {
             vhost = allArgs["vhost"];
         }
         auto tuple = MediaTuple { vhost, allArgs["app"], allArgs["stream"], "" };
-        addStreamProxy(tuple,
-                       allArgs["url"],
-                       retry_count,
-                       option,
-                       allArgs["rtp_type"],
-                       allArgs["timeout_sec"],
-                       args,
-                       [invoker,val,headerOut](const SockException &ex,const string &key) mutable{
-                           if (ex) {
-                               val["code"] = API::OtherFailed;
-                               val["msg"] = ex.what();
-                           } else {
-                               val["data"]["key"] = key;
-                           }
-                           invoker(200, headerOut, val.toStyledString());
-                       });
+        EventPollerPool::Instance().getPoller(false)->async([=]() mutable {
+            addStreamProxy(tuple,
+                           allArgs["url"],
+                           retry_count,
+                           option,
+                           allArgs["rtp_type"],
+                           allArgs["timeout_sec"],
+                           args,
+                           [invoker,val,headerOut](const SockException &ex,const string &key) mutable {
+                               if (ex) {
+                                   val["code"] = API::OtherFailed;
+                                   val["msg"] = ex.what();
+                               } else {
+                                   val["data"]["key"] = key;
+                               }
+                               invoker(200, headerOut, val.toStyledString());
+                           });
+        });
     });
 
     // 关闭拉流代理  [AUTO-TRANSLATED:5204f128]
@@ -1528,20 +1506,18 @@ void installWebApi() {
     api_regist("/index/api/listRtpServer",[](API_ARGS_MAP){
         CHECK_SECRET();
 
-        std::lock_guard<std::recursive_mutex> lck(s_rtp_server._mtx);
-        for (auto &pr : s_rtp_server._map) {
-            auto vec = split(pr.first, "/");
+        s_rtp_server.for_each([&val](const std::string &key, const RtpServer::Ptr &rtps) {
+            auto vec = split(key, "/");
             Value obj;
             obj["vhost"] = vec[0];
             obj["app"] = vec[1];
             obj["stream_id"] = vec[2];
-            auto& rtps = pr.second;
             obj["port"] = rtps->getPort();
             obj["ssrc"] = rtps->getSSRC();
             obj["tcp_mode"] = rtps->getTcpMode();
             obj["only_track"] = rtps->getOnlyTrack();
             val["data"].append(obj);
-        }
+        });
     });
 
     static auto start_send_rtp = [] (bool passive, API_ARGS_MAP_ASYNC) {
@@ -1576,6 +1552,7 @@ void installWebApi() {
         // Record the app and vhost of the sending stream
         args.recv_stream_app = allArgs["app"];
         args.recv_stream_vhost = allArgs["vhost"];
+        args.enable_origin_recv_limit = allArgs["enable_origin_recv_limit"];
         src->getOwnerPoller()->async([=]() mutable {
             try {
                 src->startSendRtp(args, [val, headerOut, invoker](uint16_t local_port, const SockException &ex) mutable {
@@ -1622,6 +1599,7 @@ void installWebApi() {
         args.recv_stream_id = allArgs["recv_stream_id"];
         args.recv_stream_app = allArgs["app"];
         args.recv_stream_vhost = allArgs["vhost"];
+        args.enable_origin_recv_limit = allArgs["enable_origin_recv_limit"];
 
         src->getOwnerPoller()->async([=]() mutable {
             try {
@@ -1654,8 +1632,10 @@ void installWebApi() {
         CHECK(muxer, "get muxer from media source failed");
 
         src->getOwnerPoller()->async([=]() mutable {
-            muxer->forEachRtpSender([&](const std::string &ssrc) mutable {
+            muxer->forEachRtpSender([&](const std::string &ssrc, const RtpSender &sender) mutable {
                 val["data"].append(ssrc);
+                val["bytesSpeed"] = (Json::UInt64)sender.getSendSpeed();
+                val["totalBytes"] = (Json::UInt64)sender.getSendTotalBytes();
             });
             invoker(200, headerOut, val.toStyledString());
         });
@@ -1699,7 +1679,7 @@ void installWebApi() {
         auto src = MediaSource::find(vhost, app, allArgs["stream_id"]);
         auto process = src ? src->getRtpProcess() : nullptr;
         if (process) {
-            process->setStopCheckRtp(true);
+            process->pauseRtpTimeout(true, allArgs["pause_seconds"]);
         } else {
             val["code"] = API::NotFound;
         }
@@ -1719,7 +1699,7 @@ void installWebApi() {
         auto src = MediaSource::find(vhost, app, allArgs["stream_id"]);
         auto process = src ? src->getRtpProcess() : nullptr;
         if (process) {
-            process->setStopCheckRtp(false);
+            process->pauseRtpTimeout(false);
         } else {
             val["code"] = API::NotFound;
         }
@@ -1743,6 +1723,30 @@ void installWebApi() {
             val["result"] = result;
             val["code"] = result ? API::Success : API::OtherFailed;
             val["msg"] = result ? "success" :  "start record failed";
+            invoker(200, headerOut, val.toStyledString());
+        });
+    });
+
+    api_regist("/index/api/startRecordTask",[](API_ARGS_MAP_ASYNC){
+        CHECK_SECRET();
+        CHECK_ARGS("vhost", "app", "stream", "path", "back_ms", "forward_ms");
+
+        auto src = MediaSource::find(allArgs["vhost"], allArgs["app"], allArgs["stream"]);
+        if (!src) {
+            throw ApiRetException("can not find the stream", API::NotFound);
+        }
+
+        src->getOwnerPoller()->async([=]() mutable {
+            std::string err;
+            std::string path;
+            try {
+                path = src->getMuxer()->startRecord(allArgs["path"], allArgs["back_ms"], allArgs["forward_ms"]);
+            } catch (std::exception &ex) {
+                err = ex.what();
+            }
+            val["code"] = err.empty() ? API::Success : API::OtherFailed;
+            val["data"]["path"] = path;
+            val["msg"] = err;
             invoker(200, headerOut, val.toStyledString());
         });
     });
@@ -1859,11 +1863,13 @@ void installWebApi() {
     // http://127.0.0.1/index/api/deleteRecordDirectroy?vhost=__defaultVhost__&app=live&stream=ss&period=2020-01-01
     api_regist("/index/api/deleteRecordDirectory", [](API_ARGS_MAP) {
         CHECK_SECRET();
-        CHECK_ARGS("vhost", "app", "stream", "period");
+        CHECK_ARGS("vhost", "app", "stream");
         auto tuple = MediaTuple{allArgs["vhost"], allArgs["app"], allArgs["stream"], ""};
         auto record_path = Recorder::getRecordPath(Recorder::type_mp4, tuple, allArgs["customized_path"]);
         auto period = allArgs["period"];
-        record_path = record_path + period + "/";
+        if (!period.empty()) {
+            record_path = record_path + period + "/";
+        }
 
         bool recording = false;
         auto name = allArgs["name"];
@@ -1896,6 +1902,15 @@ void installWebApi() {
             return true;
         }, true, true);
         File::deleteEmptyDir(record_path);
+    });
+
+    api_regist("/index/api/deleteSnapDirectory", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        CHECK_ARGS("vhost", "app", "stream");
+        GET_CONFIG(std::string, root, API::kSnapRoot);
+        auto path = File::absolutePath(allArgs["vhost"] + "/" + allArgs["app"] + "/" + allArgs["stream"] + "/" + allArgs["file"], root);
+        InfoL << "delete " << path;
+        File::delete_file(path, true);
     });
 
     // 获取录像文件夹列表或mp4文件列表  [AUTO-TRANSLATED:f7e299bc]
@@ -2033,7 +2048,7 @@ void installWebApi() {
         // 启动FFmpeg进程，开始截图，生成临时文件，截图成功后替换为正式文件  [AUTO-TRANSLATED:7d589e3f]
         // Start the FFmpeg process, start taking screenshots, generate temporary files, replace them with formal files after successful screenshots
         auto new_snap_tmp = new_snap + ".tmp";
-        FFmpegSnap::makeSnap(allArgs["url"], new_snap_tmp, allArgs["timeout_sec"], [invoker, allArgs, new_snap, new_snap_tmp](bool success, const string &err_msg) {
+        FFmpegSnap::makeSnap(allArgs["async"], allArgs["url"], new_snap_tmp, allArgs["timeout_sec"], [invoker, allArgs, new_snap, new_snap_tmp](bool success, const string &err_msg) {
             if (!success) {
                 // 生成截图失败，可能残留空文件  [AUTO-TRANSLATED:c96a4468]
                 // Screenshot generation failed, there may be residual empty files
@@ -2057,35 +2072,6 @@ void installWebApi() {
     });
 
 #ifdef ENABLE_WEBRTC
-    class WebRtcArgsImp : public WebRtcArgs {
-    public:
-        WebRtcArgsImp(const ArgsString &args, std::string session_id)
-            : _args(args)
-            , _session_id(std::move(session_id)) {}
-        ~WebRtcArgsImp() override = default;
-
-        toolkit::variant operator[](const string &key) const override {
-            if (key == "url") {
-                return getUrl();
-            }
-            return _args[key];
-        }
-
-    private:
-        string getUrl() const{
-            auto &allArgs = _args;
-            CHECK_ARGS("app", "stream");
-
-            string auth = _args["Authorization"]; // Authorization  Bearer
-            return StrPrinter << "rtc://" << _args["Host"] << "/" << _args["app"] << "/" << _args["stream"] << "?"
-                              << _args.parser.params() + "&session=" + _session_id + (auth.empty() ? "" : ("&Authorization=" + auth));
-        }
-
-    private:
-        ArgsString _args;
-        std::string _session_id;
-    };
-
     api_regist("/index/api/webrtc",[](API_ARGS_STRING_ASYNC){
         CHECK_ARGS("type");
         auto type = allArgs["type"];
@@ -2093,7 +2079,7 @@ void installWebApi() {
         CHECK(!offer.empty(), "http body(webrtc offer sdp) is empty");
 
         auto &session = static_cast<Session&>(sender);
-        auto args = std::make_shared<WebRtcArgsImp>(allArgs, sender.getIdentifier());
+        auto args = std::make_shared<WebRtcArgsImp<std::string>>(allArgs, sender.getIdentifier());
         WebRtcPluginManager::Instance().negotiateSdp(session, type, *args, [invoker, val, offer, headerOut](const WebRtcInterface &exchanger) mutable {
             auto &handler = const_cast<WebRtcInterface &>(exchanger);
             try {
@@ -2116,7 +2102,7 @@ void installWebApi() {
 
         auto &session = static_cast<Session&>(sender);
         auto location = std::string(session.overSsl() ? "https://" : "http://") + allArgs["host"] + delete_webrtc_url;
-        auto args = std::make_shared<WebRtcArgsImp>(allArgs, sender.getIdentifier());
+        auto args = std::make_shared<WebRtcArgsImp<std::string>>(allArgs, sender.getIdentifier());
         WebRtcPluginManager::Instance().negotiateSdp(session, type, *args, [invoker, offer, headerOut, location](const WebRtcInterface &exchanger) mutable {
             auto &handler = const_cast<WebRtcInterface &>(exchanger);
             try {
@@ -2149,6 +2135,103 @@ void installWebApi() {
         }
         obj->safeShutdown(SockException(Err_shutdown, "deleted by http api"));
         invoker(200, headerOut, "");
+    });
+
+    // 获取WebRTCProxyPlayer 连接信息
+    api_regist("/index/api/getWebrtcProxyPlayerInfo", [](API_ARGS_MAP_ASYNC) {
+        CHECK_SECRET();
+        CHECK_ARGS("key");
+
+        auto player_proxy = s_player_proxy.find(allArgs["key"]);
+        if (!player_proxy) {
+            throw ApiRetException("Stream proxy not found", API::NotFound);
+        }
+
+        auto media_player = player_proxy->getDelegate();
+        if (!media_player) {
+            throw ApiRetException("Media player not found", API::OtherFailed);
+        }
+
+        auto webrtc_player_imp = std::dynamic_pointer_cast<WebRtcProxyPlayerImp>(media_player);
+        if (!webrtc_player_imp) {
+            throw ApiRetException("Stream proxy is not WebRTC type", API::OtherFailed);
+        }
+
+        auto webrtc_transport = webrtc_player_imp->getWebRtcTransport();
+        if (!webrtc_transport) {
+            throw ApiRetException("WebRTC transport not available", API::OtherFailed);
+        }
+
+        std::string stream_key = allArgs["key"];
+        webrtc_transport->getTransportInfo([val, headerOut, invoker, stream_key](Json::Value transport_info) mutable {
+            transport_info["stream_key"] = stream_key;
+
+            if (transport_info.isMember("error")) {
+                Json::Value error_val;
+                error_val["code"] = API::OtherFailed;
+                error_val["msg"] = transport_info["error"].asString();
+                invoker(200, headerOut, error_val.toStyledString());
+                return;
+            }
+
+            // 成功返回结果
+            Json::Value success_val;
+            success_val["code"] = API::Success;
+            success_val["msg"] = "success";
+            success_val["data"] = transport_info;
+            invoker(200, headerOut, success_val.toStyledString());
+        });
+    });
+
+    api_regist("/index/api/addWebrtcRoomKeeper",[](API_ARGS_MAP_ASYNC){
+        CHECK_SECRET();
+        CHECK_ARGS("server_host", "server_port", "room_id", "ssl");
+        //server_host: 信令服务器host
+        //server_post: 信令服务器host
+        //room_id: 注册的id,信令服务器会对该id进行唯一性检查
+        addWebrtcRoomKeeper(allArgs["server_host"], allArgs["server_port"], allArgs["room_id"], allArgs["ssl"],
+            [val, headerOut, invoker](const SockException &ex, const string &key) mutable {
+                if (ex) {
+                    val["code"] = API::OtherFailed;
+                    val["msg"] = ex.what();
+                } else {
+                    val["msg"] = "success";
+                    val["data"]["room_key"] = key;
+                }
+                invoker(200, headerOut, val.toStyledString());
+            });
+    });
+
+    api_regist("/index/api/delWebrtcRoomKeeper",[](API_ARGS_MAP_ASYNC){
+        CHECK_SECRET();
+        CHECK_ARGS("room_key");
+
+        delWebrtcRoomKeeper(allArgs["room_key"],
+            [val, headerOut, invoker](const SockException &ex) mutable {
+                if (ex) {
+                    val["code"] = API::OtherFailed;
+                    val["msg"] = ex.what();
+                }
+                invoker(200, headerOut, val.toStyledString());
+            });
+    });
+
+    api_regist("/index/api/listWebrtcRoomKeepers", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        listWebrtcRoomKeepers([&val](const std::string& key, const WebRtcSignalingPeer::Ptr& p) {
+            Json::Value item = ToJson(p);
+            item["room_key"] = key;
+            val["data"].append(item);
+        });
+    });
+
+    api_regist("/index/api/listWebrtcRooms", [](API_ARGS_MAP) {
+        CHECK_SECRET();
+        listWebrtcRooms([&val](const std::string& key, const WebRtcSignalingSession::Ptr& p) {
+            Json::Value item = ToJson(p);
+            item["room_id"] = key;
+            val["data"].append(item);
+        });
     });
 #endif
 
@@ -2187,6 +2270,20 @@ void installWebApi() {
         // sample_ms设置为0，从配置文件加载；file_repeat可以指定，如果配置文件也指定循环解复用，那么强制开启  [AUTO-TRANSLATED:23e826b4]
         // sample_ms is set to 0, loaded from the configuration file; file_repeat can be specified, if the configuration file also specifies loop demultiplexing, then force it to be enabled
         reader->startReadMP4(0, true, allArgs["file_repeat"]);
+        auto seek_ms = allArgs["seek_ms"].as<uint32_t>();
+        auto speed = allArgs["speed"].as<float>();
+        if (seek_ms || speed) {
+            auto p = static_pointer_cast<MediaSourceEvent>(reader);
+            p->getOwnerPoller(MediaSource::NullMediaSource())->async([seek_ms, speed, p]() {
+                if (seek_ms) {
+                    p->seekTo(MediaSource::NullMediaSource(), seek_ms);
+                }
+                if (speed && speed != 1.0) {
+                    p->speed(MediaSource::NullMediaSource(), speed);
+                }
+            });
+        }
+        val["data"]["duration_ms"] = (Json::UInt64)reader->getDemuxer()->getDurationMS();
     });
 #endif
 
@@ -2241,6 +2338,53 @@ void installWebApi() {
             // No one is listening to the file download authentication event, download is not allowed
             invoker(401, StrCaseMap {}, "None http access event listener");
         }
+    });
+
+
+    api_regist("/index/api/searchOnvifDevice",[](API_ARGS_MAP_ASYNC){
+       CHECK_SECRET();
+       CHECK_ARGS("timeout_ms");
+
+       auto result = std::make_shared<Value>(std::move(val));
+       auto complete_token = std::make_shared<onceToken>(nullptr, [result, headerOut, invoker]() {
+           invoker(200, headerOut, result->toStyledString());
+       });
+       auto lam_search = [complete_token, result](const std::map<string, string> &device_info,
+                                                  const std::string &onvif_url) {
+           Value obj;
+           obj["onvif_url"] = onvif_url;
+           for (auto &pr : device_info) {
+               obj[pr.first] = pr.second;
+           }
+           (*result)["data"].append(std::move(obj));
+           //继续等待扫描
+           return true;
+       };
+       OnvifSearcher::Instance().sendSearchBroadcast(std::move(lam_search), allArgs["timeout_ms"]);
+   });
+
+    api_regist("/index/api/getStreamUrl", [](API_ARGS_MAP_ASYNC) {
+        CHECK_SECRET();
+        CHECK_ARGS("onvif_url");
+
+        SoapUtil::asyncGetStreamUri(allArgs["onvif_url"],[val, headerOut, allArgs, invoker]
+                (const SoapErr &err, const SoapUtil::GetStreamUriRetryInvoker &retry_invoker,
+                 int retry_count, const std::string &url) mutable {
+            if (err && retry_count == 0 && !allArgs["user_name"].empty() /* &&
+                (err.httpCode() == 400 || err.httpCode() == 401)*/) {
+                //第一次失败，且提供了用户密码，且确定是鉴权失败
+                retry_invoker(allArgs["user_name"], allArgs["passwd"]);
+                return;
+            }
+            val["code"] = err ? API::OtherFailed : API::Success;
+            if (err) {
+                val["http_code"] = err.httpCode();
+                val["msg"] = (string) err;
+            } else {
+                val["url"] = url;
+            }
+            invoker(200, headerOut, val.toStyledString());
+        });
     });
 
 #if defined(ENABLE_VIDEOSTACK) && defined(ENABLE_X264) && defined(ENABLE_FFMPEG)

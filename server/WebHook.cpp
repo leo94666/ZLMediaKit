@@ -229,6 +229,11 @@ void dumpMediaTuple(const MediaTuple &tuple, Json::Value& item);
 static ArgsType make_json(const MediaInfo &args) {
     ArgsType body;
     body["schema"] = args.schema;
+    if(!args.protocol.empty()){
+        body["protocol"] = args.protocol;
+    }else{
+        body["protocol"] = args.schema;
+    }
     dumpMediaTuple(args, body);
     body["params"] = args.params;
     return body;
@@ -296,7 +301,7 @@ static string getPullUrl(const string &origin_fmt, const MediaInfo &info) {
     }
     // 告知源站这是来自边沿站的拉流请求，如果未找到流请立即返回拉流失败  [AUTO-TRANSLATED:adf0d210]
     // Inform the origin station that this is a pull stream request from the edge station, if the stream is not found, please return the pull stream failure immediately
-    return string(url) + '?' + kEdgeServerParam + '&' + VHOST_KEY + '=' + info.vhost + '&' + info.params;
+    return string(url) + (strchr(url, '?') ? '&' : '?') + kEdgeServerParam + '&' + VHOST_KEY + '=' + info.vhost + '&' + info.params;
 }
 
 static void pullStreamFromOrigin(const vector<string> &urls, size_t index, size_t failed_cnt, const MediaInfo &args, const function<void()> &closePlayer) {
@@ -334,6 +339,10 @@ static mINI jsonToMini(const Value &obj) {
     mINI ret;
     if (obj.isObject()) {
         for (auto it = obj.begin(); it != obj.end(); ++it) {
+            if (it->isNull()) {
+                // 忽略null，修复wvp传null覆盖Protocol配置的问题
+                continue;
+            }
             try {
                 auto str = (*it).asString();
                 ret[it.name()] = std::move(str);
@@ -615,13 +624,25 @@ void installWebHook() {
     });
 
     NoticeCenter::Instance().addListener(&web_hook_tag, Broadcast::kBroadcastStreamNoneReader, [](BroadcastStreamNoneReaderArgs) {
+        auto auto_close = false;
+        auto muxer = sender.getMuxer();
+        if (muxer && muxer->getOption().auto_close) {
+            auto_close = true;
+        }
+
         if (!origin_urls.empty() && sender.getOriginType() == MediaOriginType::pull) {
             // 边沿站无人观看时如果是拉流的则立即停止溯源  [AUTO-TRANSLATED:a1429c77]
             // If no one is watching at the edge station, stop tracing immediately if it is pulling
-            sender.close(false);
-            WarnL << "无人观看主动关闭流:" << sender.getOriginUrl();
+            if (!auto_close) {
+                auto ptr = sender.shared_from_this();
+                sender.getOwnerPoller()->async([ptr]() {
+                    ptr->close(false);
+                });
+                WarnL << "Auto close stream when none reader: " << sender.getOriginUrl();
+            }
             return;
         }
+
         GET_CONFIG(string, hook_stream_none_reader, Hook::kOnStreamNoneReader);
         if (!hook_enable || hook_stream_none_reader.empty()) {
             return;
@@ -633,13 +654,17 @@ void installWebHook() {
         weak_ptr<MediaSource> weakSrc = sender.shared_from_this();
         // 执行hook  [AUTO-TRANSLATED:1df68201]
         // Execute hook
-        do_http_hook(hook_stream_none_reader, body, [weakSrc](const Value &obj, const string &err) {
+        do_http_hook(hook_stream_none_reader, body, [weakSrc, auto_close](const Value &obj, const string &err) {
+            if (auto_close) {
+                // 在上层已经关闭了
+                return;
+            }
             bool flag = obj["close"].asBool();
             auto strongSrc = weakSrc.lock();
             if (!flag || !err.empty() || !strongSrc) {
                 return;
             }
-            strongSrc->close(false);
+            strongSrc->getOwnerPoller()->async([strongSrc]() { strongSrc->close(false); });
             WarnL << "无人观看主动关闭流:" << strongSrc->getOriginUrl();
         });
     });

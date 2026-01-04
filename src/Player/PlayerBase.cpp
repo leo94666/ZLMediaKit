@@ -15,7 +15,12 @@
 #include "Rtmp/FlvPlayer.h"
 #include "Http/HlsPlayer.h"
 #include "Http/TsPlayerImp.h"
-
+#ifdef ENABLE_SRT
+#include "../srt/SrtPlayerImp.h"
+#endif // ENABLE_SRT
+#ifdef ENABLE_WEBRTC
+#include "../webrtc/WebRtcProxyPlayerImp.h"
+#endif // ENABLE_WEBRTC
 using namespace std;
 using namespace toolkit;
 
@@ -34,7 +39,13 @@ PlayerBase::Ptr PlayerBase::createPlayer(const EventPoller::Ptr &in_poller, cons
             delete ptr;
         }
     };
+
     string url = url_in;
+    trim(url);
+    if (url.empty()) {
+        throw std::invalid_argument("invalid play url: " + url_in);
+    }
+
     string prefix = findSubString(url.data(), NULL, "://");
     auto pos = url.find('?');
     if (pos != string::npos) {
@@ -70,6 +81,17 @@ PlayerBase::Ptr PlayerBase::createPlayer(const EventPoller::Ptr &in_poller, cons
         }
     }
 
+#ifdef ENABLE_SRT
+    if (strcasecmp("srt", prefix.data()) == 0) {
+        return PlayerBase::Ptr(new SrtPlayerImp(poller), release_func);
+    }
+#endif//ENABLE_SRT
+#ifdef ENABLE_WEBRTC
+    if ((strcasecmp("webrtc", prefix.data()) == 0 || strcasecmp("webrtcs", prefix.data()) == 0)) {
+        return PlayerBase::Ptr(new WebRtcProxyPlayerImp(poller), release_func);
+    }
+#endif//ENABLE_WEBRTC
+
     throw std::invalid_argument("not supported play schema:" + url_in);
 }
 
@@ -78,6 +100,8 @@ PlayerBase::PlayerBase() {
     this->mINI::operator[](Client::kMediaTimeoutMS) = 5000;
     this->mINI::operator[](Client::kBeatIntervalMS) = 5000;
     this->mINI::operator[](Client::kWaitTrackReady) = true;
+    this->mINI::operator[](Client::kLatency) = 0;
+    this->mINI::operator[](Client::kPassPhrase) = "";
 }
 
 } /* namespace mediakit */

@@ -11,58 +11,32 @@
 #include "Opus.h"
 #include "Extension/Factory.h"
 #include "Extension/CommonRtp.h"
-#include "Extension/CommonRtmp.h"
-
+#include "OpusRtmp.h"
+#include "opus-head.h"
 using namespace std;
 using namespace toolkit;
 
 namespace mediakit {
 
-/**
- * Opus类型SDP
- * Opus type SDP
- 
- * [AUTO-TRANSLATED:6c0a72ed]
- */
-class OpusSdp : public Sdp {
-public:
-    /**
-     * 构造opus sdp
-     * @param payload_type rtp payload type
-     * @param sample_rate 音频采样率
-     * @param channels 通道数
-     * @param bitrate 比特率
-     * Construct opus sdp
-     * @param payload_type rtp payload type
-     * @param sample_rate audio sample rate
-     * @param channels number of channels
-     * @param bitrate bitrate
-     
-     
-     * [AUTO-TRANSLATED:40713e9d]
-     */
-    OpusSdp(int payload_type, int sample_rate, int channels, int bitrate) : Sdp(sample_rate, payload_type) {
-        _printer << "m=audio 0 RTP/AVP " << payload_type << "\r\n";
-        if (bitrate) {
-            _printer << "b=AS:" << bitrate << "\r\n";
-        }
-        _printer << "a=rtpmap:" << payload_type << " " << getCodecName(CodecOpus) << "/" << sample_rate  << "/" << channels << "\r\n";
+void OpusTrack::setExtraData(const uint8_t *data, size_t size) {
+    opus_head_t header;
+    if (opus_head_load(data, size, &header) > 0) {
+        // Successfully parsed Opus header
+        _sample_rate = header.input_sample_rate;
+        _channels = header.channels;
     }
+}
 
-    string getSdp() const override {
-        return _printer;
-    }
-
-private:
-    _StrPrinter _printer;
-};
-
-Sdp::Ptr OpusTrack::getSdp(uint8_t payload_type) const {
-    if (!ready()) {
-        WarnL << getCodecName() << " Track未准备好";
-        return nullptr;
-    }
-    return std::make_shared<OpusSdp>(payload_type, getAudioSampleRate(), getAudioChannel(), getBitRate() / 1024);
+Buffer::Ptr OpusTrack::getExtraData() const {
+    struct opus_head_t opus = { 0 };
+    opus.version = 1;
+    opus.channels = getAudioChannel();
+    opus.input_sample_rate = getAudioSampleRate();
+    // opus.pre_skip = 120;
+    opus.channel_mapping_family = 0;
+    auto ret = BufferRaw::create(29);
+    ret->setSize(opus_head_save(&opus, (uint8_t *)ret->data(), ret->getCapacity()));
+    return ret;
 }
 
 namespace {
@@ -88,11 +62,11 @@ RtpCodec::Ptr getRtpDecoderByCodecId() {
 }
 
 RtmpCodec::Ptr getRtmpEncoderByTrack(const Track::Ptr &track) {
-    return std::make_shared<CommonRtmpEncoder>(track);
+    return std::make_shared<OpusRtmpEncoder>(track);
 }
 
 RtmpCodec::Ptr getRtmpDecoderByTrack(const Track::Ptr &track) {
-    return std::make_shared<CommonRtmpDecoder>(track);
+    return std::make_shared<OpusRtmpDecoder>(track);
 }
 
 Frame::Ptr getFrameFromPtr(const char *data, size_t bytes, uint64_t dts, uint64_t pts) {
